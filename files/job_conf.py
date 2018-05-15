@@ -1,5 +1,7 @@
 from galaxy.jobs import JobDestination
-#from galaxy.jobs.mapper import JobMappingException
+from .runners.condor import Condor
+from .runners.sge import Sge
+# from galaxy.jobs.mapper import JobMappingException
 
 import backoff
 import copy
@@ -14,12 +16,6 @@ import yaml
 
 log = logging.getLogger(__name__)
 
-# Maximum resources
-CONDOR_MAX_CORES = 40
-CONDOR_MAX_MEM = 250 - 2
-SGE_MAX_CORES = 24
-SGE_MAX_MEM = 256 - 2
-
 # The default / base specification for the different environments.
 SPECIFICATION_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'destination_specifications.yaml')
 with open(SPECIFICATION_PATH, 'r') as handle:
@@ -30,7 +26,6 @@ with open(TOOL_DESTINATION_PATH, 'r') as handle:
     TOOL_DESTINATIONS = yaml.load(handle)
 
 TRAINING_MACHINES = {}
-STALE_CONDOR_HOST_INTERVAL = 60  # seconds
 
 
 def get_tool_id(tool_id):
@@ -82,6 +77,11 @@ def build_spec(tool_spec):
     # A dictionary that stores the "raw" details that went into the template.
     raw_allocation_details = {}
 
+    if destination == 'sge':
+        runner = Sge()
+    elif 'condor' in destination:
+        runner = Condor()
+
     # We define the default memory and cores for all jobs. This is
     # semi-internal, and may not be properly propagated to the end tool
     tool_memory = tool_spec.get('mem', 4)
@@ -90,12 +90,8 @@ def build_spec(tool_spec):
     # produce unschedulable jobs, requesting more ram/cpu than is available in a
     # given location. Currently we clamp those values rather than intelligently
     # re-scheduling to a different location due to TaaS constraints.
-    if destination == 'sge':
-        tool_memory = min(tool_memory, SGE_MAX_MEM)
-        tool_cores = min(tool_cores, SGE_MAX_CORES)
-    elif 'condor' in destination:
-        tool_memory = min(tool_memory, CONDOR_MAX_MEM)
-        tool_cores = min(tool_cores, CONDOR_MAX_CORES)
+    tool_memory = min(tool_memory, runner.MAX_MEM)
+    tool_cores = min(tool_cores, runner.MAX_CORES)
 
     kwargs = {
         # Higher numbers are lower priority, like `nice`.
@@ -109,41 +105,10 @@ def build_spec(tool_spec):
         params['nativeSpecification'] = params['nativeSpecification'].replace('\n', ' ').strip()
 
     # We have some destination specific kwargs. `nativeSpecExtra` and `tmp` are only defined for SGE
-    if destination == 'sge':
-        if 'cores' in tool_spec:
-            kwargs['PARALLELISATION'] = '-pe "pe*" %s' % tool_cores
-            # memory is defined per-core, and the input number is in gigabytes.
-            real_memory = int(1024 * tool_memory / tool_spec['cores'])
-            # Supply to kwargs with M for megabyte.
-            kwargs['MEMORY'] = '%sM' % real_memory
-            raw_allocation_details['mem'] = tool_memory
-            raw_allocation_details['cpu'] = tool_cores
-
-        if 'nativeSpecExtra' in tool_spec:
-            kwargs['NATIVE_SPEC_EXTRA'] = tool_spec['nativeSpecExtra']
-
-        # Large TMP dir
-        if tool_spec.get('tmp', None) == 'large':
-            kwargs['NATIVE_SPEC_EXTRA'] += '-l has_largetmp=1'
-
-        # Environment variables, SGE specific.
-        if 'env' in tool_spec and '_JAVA_OPTIONS' in tool_spec['env']:
-            params['nativeSpecification'] = params['nativeSpecification'].replace('-v _JAVA_OPTIONS', '')
-    elif 'condor' in destination:
-        if 'cores' in tool_spec:
-            kwargs['PARALLELISATION'] = tool_cores
-            raw_allocation_details['cpu'] = tool_cores
-        else:
-            del params['request_cpus']
-
-        if 'mem' in tool_spec:
-            raw_allocation_details['mem'] = tool_memory
-
-        if 'requirements' in tool_spec:
-            params['requirements'] = tool_spec['requirements']
-
-        if 'rank' in tool_spec:
-            params['rank'] = tool_spec['rank']
+    kw_update, raw_alloc_update, params_update = runner.custom_spec(tool_spec, params, kwargs, tool_memory, tool_cores)
+    kwargs.update(kw_update)
+    raw_allocation_details.update(raw_alloc_update)
+    params.update(params_update)
 
     # Update env and params from kwargs.
     env.update(tool_spec.get('env', {}))
@@ -152,155 +117,14 @@ def build_spec(tool_spec):
     params = {k: str(v).format(**kwargs) for (k, v) in params.items()}
 
     if destination == 'sge':
-        runner = 'drmaa'
+        runner_name = 'drmaa'
     elif 'condor' in destination:
-        runner = 'condor'
+        runner_name = 'condor'
     else:
-        runner = 'local'
+        runner_name = 'local'
 
     env = [dict(name=k, value=v) for (k, v) in env.items()]
-    return env, params, runner, raw_allocation_details
-
-
-def drmaa_is_available():
-    try:
-        os.stat('/usr/local/galaxy/temporarily-disable-drmaa')
-        return False
-    except OSError:
-        return True
-
-
-def condor_is_available():
-    try:
-        os.stat('/usr/local/galaxy/temporarily-disable-condor')
-        return False
-    except OSError:
-        pass
-
-    try:
-        executors = subprocess.check_output(['condor_status'])
-        # No executors, assume offline.
-        if len(executors.strip()) == 0:
-            return False
-
-        return True
-    except subprocess.CalledProcessError:
-        return False
-    except FileNotFoundError:
-        # No condor binary
-        return False
-
-
-def get_training_machines(group='training'):
-    # IF more than 60 seconds out of date, refresh.
-    global TRAINING_MACHINES
-
-    # Define the group if it doesn't exist.
-    if group not in TRAINING_MACHINES:
-        TRAINING_MACHINES[group] = {
-            'updated': 0,
-            'machines': [],
-        }
-
-    if time.time() - TRAINING_MACHINES[group]['updated'] > STALE_CONDOR_HOST_INTERVAL:
-        # Fetch a list of machines
-        try:
-            machine_list = subprocess.check_output(['condor_status', '-long', '-attributes', 'Machine'])
-        except subprocess.CalledProcessError:
-            machine_list = ''
-        except FileNotFoundError:
-            machine_list = ''
-
-        # Strip them
-        TRAINING_MACHINES[group]['machines'] = [
-            x[len("Machine = '"):-1]
-            for x in machine_list.strip().split('\n\n')
-            if '-' + group + '-' in x
-        ]
-        # And record that this has been updated recently.
-        TRAINING_MACHINES[group]['updated'] = time.time()
-    return TRAINING_MACHINES[group]['machines']
-
-
-def avoid_machines(permissible=None):
-    """
-    Obtain a list of the special training machines in the form that can be used
-    in a rank/requirement expression.
-
-    :param permissible: A list of training groups that are permissible to the user and shouldn't be included in the expression
-    :type permissible: list(str) or None
-
-    """
-    if permissible is None:
-        permissible = []
-    machines = set(get_training_machines())
-    # List of those to remove.
-    to_remove = set()
-    # Loop across permissible machines in order to remove them from the machine dict.
-    for allowed in permissible:
-        for m in machines:
-            if allowed in m:
-                to_remove = to_remove.union(set([m]))
-    # Now we update machine list with removals.
-    machines = machines.difference(to_remove)
-    # If we want to NOT use the machines, construct a list with `!=`
-    data = ['(machine != "%s")' % m for m in sorted(machines)]
-    if len(data):
-        return '( ' + ' && '.join(data) + ' )'
-    return ''
-
-
-def prefer_machines(training_identifiers, machine_group='training'):
-    """
-    Obtain a list of the specially tagged machines in the form that can be used
-    in a rank/requirement expression.
-
-    :param training_identifiers: A list of training groups that are permissible to the user and shouldn't be included in the expression
-    :type training_identifiers: list(str) or None
-    """
-    if training_identifiers is None:
-        training_identifiers = []
-
-    machines = set(get_training_machines(group=machine_group))
-    allowed = set()
-    for identifier in training_identifiers:
-        for m in machines:
-            if identifier in m:
-                allowed = allowed.union(set([m]))
-
-    # If we want to use the machines, construct a list with `==`
-    data = ['(machine == "%s")' % m for m in sorted(allowed)]
-    if len(data):
-        return '( ' + ' || '.join(data) + ' )'
-    return ''
-
-
-def reroute_to_dedicated(tool_spec, user_roles):
-    """
-    Re-route users to correct destinations. Some users will be part of a role
-    with dedicated training resources.
-    """
-    # Collect their possible training roles identifiers.
-    training_roles = [role[len('training-'):] for role in user_roles if role.startswith('training-')]
-
-    # No changes to specification.
-    if len(training_roles) == 0:
-        # However if it is running on condor, make sure that it doesn't run on the training machines.
-        if 'runner' in tool_spec and tool_spec['runner'] == 'condor':
-            # Require that the jobs do not run on these dedicated training machines.
-            return {'requirement': avoid_machines()}
-        # If it isn't running on condor, no changes.
-        return {}
-
-    # Otherwise, the user does have one or more training roles.
-    # So we must construct a requirement / ranking expression.
-    return {
-        # We require that it does not run on machines that the user is not in the role for.
-        'requirements': avoid_machines(permissible=training_roles),
-        # We then rank based on what they *do* have the roles for
-        'rank': prefer_machines(training_roles),
-        'runner': 'condor',
-    }
+    return env, params, runner_name, raw_allocation_details
 
 
 def _finalize_tool_spec(tool_id, user_roles, memory_scale=1.0):
