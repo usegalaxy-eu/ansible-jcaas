@@ -1,7 +1,0 @@
-requests
-flask
-pyyaml
-gunicorn
-raven[flask]
-backoff
-Flask-Stats

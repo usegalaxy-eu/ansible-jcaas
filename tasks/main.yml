@@ -6,23 +6,19 @@
     group: "{{ jobconf_group }}"
     mode: 0750
 
-- name: Send files
-  copy:
-    src: "{{ item }}"
-    dest: "{{ jobconf_directory }}/{{ item }}"
-    owner: "{{ jobconf_user }}"
-    group: "{{ jobconf_group }}"
-    mode: 0640
-  with_items:
-    - flask_job_conf.py
-    - job_conf.py
-    - requirements.txt
-  register: jobconf_task
+- name: Clone repo
+  become: true
+  become_user: "{{ jobconf_user }}"
+  git:
+    repo: 'https://github.com/usegalaxy-eu/jcaas/'
+    dest: "{{ jobconf_directory }}"
+    version: "{{ jobconf_version }}"
+  register: repo
 
 - name: Send templates
   template:
     src: "{{ item }}"
-    dest: "{{ jobconf_directory }}/{{ item }}"
+    dest: "{{ jobconf_config_directory }}/{{ item }}"
     owner: "{{ jobconf_user }}"
     group: "{{ jobconf_group }}"
     mode: 0640
@@ -52,4 +48,4 @@
 
 - name: "Restart jobconf process"
   shell: "{{ jobconf_supervisord }} restart job_conf_service"
-  when: (jobconf_task.changed or jobconf_tpl.changed or jobconf_runner.changed or jobconf_dep.changed) and (jobconf_supervisord is defined)
+  when: (repo.changed or jobconf_tpl.changed or jobconf_runner.changed or jobconf_dep.changed) and (jobconf_supervisord is defined)

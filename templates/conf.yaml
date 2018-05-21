@@ -7,3 +7,7 @@ statsd:
     host: {{ jobconf_statsd.host }}
     port: {{ jobconf_statsd.port }}
     prefix: {{ jobconf_statsd.prefix }}
+
+jcaas:
+    tools: {{ jobconf_directory }}/tool_destinations.yaml
+    dests: {{ jobconf_directory }}/destination_specifications.yaml

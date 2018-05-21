@@ -1,5 +1,9 @@
 ---
+jobconf_version: master
+
 jobconf_directory: /usr/local/galaxy/galaxy-jobconf
+jobconf_config_directory: /usr/local/galaxy/galaxy-jobconf-config
+
 jobconf_venv: "{{ jobconf_directory }}/.venv"
 jobconf_user: galaxy
 jobconf_group: galaxy
